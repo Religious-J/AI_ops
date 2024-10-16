@@ -2,13 +2,9 @@ import numpy as np
 
 # (Cin, kH, kW, Cout) =>  (kH, kW, (Cin+31)//32, (Cout+31)//32, 32, 32)
 def conv_pvc_trans_weight_cpu(ptr_in, Cin, kH, kW, Cout):
-    # 按 32 分块
     Cin_tot = (Cin + 31) // 32
     Cout_tot = (Cout + 31) // 32
-    
-    # 初始化输出矩阵, 大小为 (H * W * Cin/32 * Cout/32 * 32 * 32)
     ptr_out = np.zeros((kH * kW, Cin_tot, Cout_tot, 32, 32), dtype=np.float32)
-
     tot_mission = Cin_tot * kH * kW * Cout_tot
     blk = Cin_tot * Cout_tot
 
