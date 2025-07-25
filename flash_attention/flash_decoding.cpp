@@ -1,221 +1,229 @@
 #include <iostream>
-#include <math.h>
 #include <vector>
+#include <cmath>
+#include <cassert>
+#include <algorithm>
 
-std::vector<float> natvieSoftmax(std::vector<float> &src) {
-  std::vector<float> dst;
-  dst.resize(src.size());
+using namespace std;
 
-  float sum = 0.f;
-
-  for (int i = 0; i < src.size(); i++) {
-    sum += std::exp(src[i]);
-  }
-
-  for (int i = 0; i < src.size(); i++) {
-    dst[i] = std::exp(src[i]) / sum;
-  }
-
-  return dst;
+// 计算 dot product
+float dot_product(const vector<float>& a, const vector<float>& b) {
+    assert(a.size() == b.size());
+    float result = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        result += a[i] * b[i];
+    }
+    return result;
 }
 
-std::vector<float> safeSoftmax(std::vector<float> &src) {
-  std::vector<float> dst;
-  dst.resize(src.size());
-
-  float max_value = -INFINITY;
-  float sum = 0.f;
-
-  for (int i = 0; i < src.size(); i++) {
-    max_value = std::max(max_value, src[i]);
-  }
-
-  for (int i = 0; i < src.size(); i++) {
-    sum += std::exp(src[i] - max_value);
-  }
-
-  for (int i = 0; i < src.size(); i++) {
-    dst[i] = std::exp(src[i] - max_value) / sum;
-  }
-
-  return dst;
+// softmax
+vector<float> softmax(const vector<float>& logits) {
+    vector<float> result(logits.size());
+    float max_logit = *max_element(logits.begin(), logits.end());
+    float sum = 0.0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        result[i] = exp(logits[i] - max_logit);
+        sum += result[i];
+    }
+    for (float& val : result) {
+        val /= sum;
+    }
+    return result;
 }
 
-std::vector<float> onlineSoftmax(std::vector<float> &src) {
-  std::vector<float> dst;
-  dst.resize(src.size());
+// decoder attention 计算
+vector<float> decoder_attention(
+    const vector<float>& q,
+    const vector<vector<float>>& k_mat,
+    const vector<vector<float>>& v_mat
+) {
+    size_t d_k = q.size();
+    size_t seq_len = k_mat.size();
 
-  float max_value = -INFINITY;
-  float pre_max_value = 0.f;
-  float sum;
+    // 1. 计算 attention scores (q·k / sqrt(d_k))
+    vector<float> scores(seq_len);
+    for (size_t i = 0; i < seq_len; ++i) {
+        scores[i] = dot_product(q, k_mat[i]) / sqrt(d_k);
+    }
+ 
+    // 2. softmax
+    vector<float> attn_weights = softmax(scores);
 
-  for (int i = 0; i < src.size(); i++) {
-    max_value = std::max(max_value, src[i]);
-    sum = sum * std::exp(pre_max_value - max_value) +
-          std::exp(src[i] - max_value);
-    pre_max_value = max_value;
-  }
+    // 3. 加权求和 V
+    vector<float> output(v_mat[0].size(), 0.0);
+    for (size_t i = 0; i < seq_len; ++i) {
+        for (size_t j = 0; j < v_mat[0].size(); ++j) {
+            output[j] += attn_weights[i] * v_mat[i][j];
+        }
+    }
 
-  for (int i = 0; i < src.size(); i++) {
-    dst[i] = std::exp(src[i] - max_value) / sum;
-  }
-
-  return dst;
+    return output;
 }
 
-float onlineSoftmaxWithDotSample(std::vector<float> &src,
-                                 std::vector<float> &value) {
+// src: (len_tile,)
+// value: (len_tile, size_per_head)
+// => (size_per_head,)
+std::tuple<float, vector<float>> onlineSoftmaxWithDot1PASS(
+    std::vector<float> &src, vector<vector<float>> &value) {
 
-  float dst = 0.f;
-  float max_value = -INFINITY;
-  float pre_max_value = 0.f;
-  float sum;
+    size_t len_tile = src.size();
+    size_t size_per_head = value[0].size();
 
-  for (int i = 0; i < src.size(); i++) {
-    max_value = std::max(max_value, src[i]);
-    sum = sum * std::exp(pre_max_value - max_value) +
-          std::exp(src[i] - max_value);
-    pre_max_value = max_value;
-  }
+    vector<float> lse_vector(size_per_head);
+    vector<float> O_local_vector(size_per_head);
 
-  for (int i = 0; i < src.size(); i++) {
-    dst += std::exp(src[i] - max_value) / sum * value[i];
-  }
+    float sum_for_lse = 0.f;
+    for (int i = 0; i < len_tile; i++) {
+        sum_for_lse += std::exp(src[i]);
+    }
+    float lse = logf(sum_for_lse);
 
-  return dst;
+    for (int loop = 0; loop < size_per_head; loop++) {
+        float O_local = 0.f;
+        float max_value = -INFINITY;
+        float pre_max_value = 0.f;
+        float pre_sum = 0.f;
+        float sum = 0.f;
+
+        for (int i = 0; i < len_tile; i++) {
+
+          max_value = std::max(max_value, src[i]);
+          sum = sum * std::exp(pre_max_value - max_value) +
+                std::exp(src[i] - max_value);
+
+          O_local = O_local * pre_sum * std::exp(pre_max_value - max_value) / sum +
+                std::exp(src[i] - max_value) / sum * value[i][loop];
+
+          pre_max_value = max_value;
+          pre_sum = sum;
+
+        }
+        O_local_vector[loop] = O_local;
+    }
+
+  return std::make_tuple(lse, O_local_vector);
 }
 
-float onlineSoftmaxWithDot1PASS(std::vector<float> &src,
-                                std::vector<float> &value) {
+std::tuple<float, std::vector<float>> onlineSoftmaxWithDot1PASS_v2(
+    const std::vector<float> &src, const std::vector<std::vector<float>> &value) {
 
-  float dst = 0.f;
-  float max_value = -INFINITY;
-  float pre_max_value = 0.f;
-  float pre_sum = 0.f;
-  float sum = 0.f;
+    size_t len_tile = src.size();
+    size_t size_per_head = value[0].size();
 
-  for (int i = 0; i < src.size(); i++) {
-    max_value = std::max(max_value, src[i]);
-    sum = sum * std::exp(pre_max_value - max_value) +
-          std::exp(src[i] - max_value);
-    dst = dst * (pre_sum * std::exp(pre_max_value - max_value) / sum) +
-          std::exp(src[i] - max_value) / sum * value[i];
-    pre_max_value = max_value;
-    pre_sum = sum;
-  }
+    float max_value = -INFINITY;
+    float pre_max_value = -INFINITY;
+    float sum = 0.f;
 
-  return dst;
+    std::vector<float> O_prime(size_per_head, 0.f);
+
+    for (int i = 0; i < len_tile; i++) {
+        float x_i = src[i];
+
+        max_value = std::max(max_value, x_i);
+        float exp_new = std::exp(x_i - max_value);
+        float exp_scale = (i == 0) ? 0.f : std::exp(pre_max_value - max_value);
+        sum = sum * exp_scale + exp_new;
+
+        for (int j = 0; j < size_per_head; j++) {
+            O_prime[j] = O_prime[j] * exp_scale + exp_new * value[i][j];
+        }
+
+        pre_max_value = max_value;
+    }
+
+    // Compute logsumexp (lse)
+    float lse = logf(sum) + max_value;
+
+    // Recover final O by dividing by sum
+    std::vector<float> O_local(size_per_head);
+    for (int j = 0; j < size_per_head; j++) {
+        O_local[j] = O_prime[j] / sum;
+    }
+
+    return std::make_tuple(lse, O_local);
 }
 
-std::tuple<float, float, float> onlineSoftmaxWithDot1PASS_PART(
-    std::vector<float> &src, std::vector<float> &value, int begin, int end,
-    float dst_, float pre_max_value_, float pre_sum_) {
+vector<float> flash_decoding(
+    const vector<float>& q,
+    const vector<vector<float>>& k_mat,
+    const vector<vector<float>>& v_mat
+) {
+    size_t d_k = q.size();
+    size_t seq_len = k_mat.size();
 
-  float dst = dst_;
-  float max_value = pre_max_value_;
-  float pre_max_value = pre_max_value_;
-  float pre_sum = pre_sum_;
-  float sum = pre_sum_;
+    // 对 k v 进行分块计算
+    const size_t len_tile = 2;
+    const size_t loops = (seq_len + len_tile - 1) / len_tile;
 
-  for (int i = begin; i < end; i++) {
-    max_value = std::max(max_value, src[i]);
-    sum = sum * std::exp(pre_max_value - max_value) +
-          std::exp(src[i] - max_value);
-    dst = dst * (pre_sum * std::exp(pre_max_value - max_value) / sum) +
-          std::exp(src[i] - max_value) / sum * value[i];
-    pre_max_value = max_value;
-    pre_sum = sum;
-  }
+    // 块1
+    vector<float> qk1(len_tile);
+    // (1, size_per_head) * (size_per_head, len_tile) =  (1, len_tile)
+    for (size_t i = 0; i < len_tile; i++) {
+        qk1[i] = dot_product(q, k_mat[i]) / sqrt(d_k);
+    }
 
-  return std::make_tuple(dst, pre_max_value, pre_sum);
+    // (1, len_tile) * (len_tile, size_per_head) = (1, size_per_head)
+    // 切 v
+    std::vector<std::vector<float>> v1 = {v_mat[0], v_mat[1]};
+    auto [lse1, O_local1] =  onlineSoftmaxWithDot1PASS_v2(qk1, v1);
+
+    // 块2
+    vector<float> qk2(len_tile);
+    // (1, size_per_head) * (size_per_head, len_tile) =  (1, len_tile)
+    for (size_t i = len_tile; i < 2 * len_tile; i++) {
+        qk2[i-2] = dot_product(q, k_mat[i]) / sqrt(d_k);
+    }
+
+    // (1, len_tile) * (len_tile, size_per_head) = (1, size_per_head)
+    // 切 v
+    std::vector<std::vector<float>> v2 = {v_mat[2], v_mat[3]};
+
+    auto [lse2, O_local2] =  onlineSoftmaxWithDot1PASS_v2(qk2, v2);
+
+    // reduction
+    vector<float> output(d_k);
+
+    for (int i = 0; i < d_k; i++) {
+        float LSE_final = logf(std::exp(lse1) + std::exp(lse2));
+        float O_final = std::exp(lse1 - LSE_final) * O_local1[i] + std::exp(lse2 - LSE_final) * O_local2[i];
+
+        output[i] = O_final;
+    }
+
+    return output;
 }
 
+// 测试
 int main() {
-  std::vector<float> src = {2.0f, 2.55f, 2.2f, 4.3f, 3.25f};
-  std::vector<float> dst = natvieSoftmax(src);
+    // dim = 4，q_len = 1，k_len = 4
+    vector<float> q = {2.0f, 2.55f, 2.2f, 4.3f};
+    vector<vector<float>> k = {
+        {2.2, 4.1, 2.1, 1.3},
+        {4.01, 1.3, 3.4, 2.1},
+        {2.1, 1.2, 3.1, 1.01},
+        {1.01, 4.2, 2.1, 2.3}
+    };
+    vector<vector<float>> v = {
+        {1.0, 0.1, 0.1, 0.2},
+        {0.1, 1.0, 0.2, 0.3},
+        {0.3, 0.3, 1.0, 0.4},
+        {0.4, 0.5, 0.4, 1.1}
+    };
 
-  for (const float element : dst) {
-    std::cout << element << " ";
-  }
-  std::cout << std::endl;
+    vector<float> output = decoder_attention(q, k, v);
 
-  std::vector<float> dst1 = natvieSoftmax(src);
+    cout << "Output: ";
+    for (float val : output) {
+        cout << val << " ";
+    }
+    cout << endl;
 
-  for (const float element : dst1) {
-    std::cout << element << " ";
-  }
-  std::cout << std::endl;
+    vector<float> output_2 = flash_decoding(q, k, v);
 
-  std::vector<float> dst2 = onlineSoftmax(src);
-
-  for (const float element : dst2) {
-    std::cout << element << " ";
-  }
-  std::cout << std::endl;
-
-  std::vector<float> val = {1.57f, 0.55f, 7.2f, 2.3f, 3.25f};
-  float result = onlineSoftmaxWithDotSample(src, val);
-  std::cout << result << std::endl;
-
-  float result1 = onlineSoftmaxWithDot1PASS(src, val);
-  std::cout << result1 << std::endl;
-
-  // tiling => flash atten
-  auto [result_p1, pre_max_value_p1, pre_sum_p1] =
-      onlineSoftmaxWithDot1PASS_PART(src, val, 0, 2, 0.f, 0.f, 0.f);
-  auto [result_p2, pre_max_value_p2, pre_sum_p2] =
-      onlineSoftmaxWithDot1PASS_PART(src, val, 2, 5, result_p1,
-                                     pre_max_value_p1, pre_sum_p1);
-  std::cout << result_p2 << std::endl;
-
-  // flash decoding D
-  auto [result_d1, pre_max_value_d1, pre_sum_d1] =
-      onlineSoftmaxWithDot1PASS_PART(src, val, 0, 2, 0.f, 0.f, 0.f);
-  auto [result_d2, pre_max_value_d2, pre_sum_d2] =
-      onlineSoftmaxWithDot1PASS_PART(src, val, 2, 5, 0.f, 0.f, 0.f);
-
-  float sum_1 = 0.f;
-  float sum_2 = 0.f;
-
-  for (int i = 0; i < 2; i++) {
-    sum_1 += std::exp(src[i]);
-  }
-  for (int i = 2; i < 5; i++) {
-    sum_2 += std::exp(src[i]);
-  }
-
-  float lse_1 = logf(sum_1);
-  float lse_2 = logf(sum_2);
-
-  float result_d =
-      result_d1 * std::exp(lse_1) / (std::exp(lse_1) + std::exp(lse_2)) +
-      result_d2 * std::exp(lse_2) / (std::exp(lse_1) + std::exp(lse_2));
-
-  std::cout << result_d << std::endl;
-
-  // flash decoding F
-  /**
-   * For those who don't know how to do the reduction: each split i outputs O_i and LSE_i, then you can get the final output by
-   *    LSE_final = log(sum(exp(LSE_i)))
-   *    O_final = sum(exp(LSE_i - LSE_final) * O_i)
-   * In the CUDA implementation, it do the "logsumexp trick" again -- subtract the max(LSE_i) to avoid overflow.
-   */
-
-  auto [result_f1, pre_max_value_f1, pre_sum_f1] =
-      onlineSoftmaxWithDot1PASS_PART(src, val, 0, 2, 0.f, 0.f, 0.f);
-  auto [result_f2, pre_max_value_f2, pre_sum_f2] =
-      onlineSoftmaxWithDot1PASS_PART(src, val, 2, 5, 0.f, 0.f, 0.f);
-
-  // float LSE_final = logf(std::exp(lse_1) + std::exp(lse_2));
-  // float O_final = std::exp(lse_1 - LSE_final) * result_d1 + std::exp(lse_2 - LSE_final) * result_d2;
-
-  // logsumexp trick
-  // log(sum(exp(LSE_i - max))) + max
-  float LSE_MAX = std::max(lse_1, lse_2);
-  float LSE_final = logf(std::exp(lse_1 - LSE_MAX) + std::exp(lse_2 - LSE_MAX)) + LSE_MAX;
-  float O_final = std::exp(lse_1 - LSE_final) * result_d1 + std::exp(lse_2 - LSE_final) * result_d2;
-
-  std::cout << O_final << std::endl;
-
-  return 0;
+    cout << "Output2: ";
+    for (float val : output_2) {
+        cout << val << " ";
+    }
+    cout << endl;
+    return 0;
 }
