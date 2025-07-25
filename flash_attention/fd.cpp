@@ -86,19 +86,61 @@ std::tuple<float, vector<float>> onlineSoftmaxWithDot1PASS(
         float sum = 0.f;
 
         for (int i = 0; i < len_tile; i++) {
+
           max_value = std::max(max_value, src[i]);
           sum = sum * std::exp(pre_max_value - max_value) +
                 std::exp(src[i] - max_value);
-          O_local = O_local * (pre_sum * std::exp(pre_max_value - max_value) / sum) +
+
+          O_local = O_local * pre_sum * std::exp(pre_max_value - max_value) / sum +
                 std::exp(src[i] - max_value) / sum * value[i][loop];
 
           pre_max_value = max_value;
           pre_sum = sum;
+
         }
         O_local_vector[loop] = O_local;
     }
 
   return std::make_tuple(lse, O_local_vector);
+}
+
+std::tuple<float, std::vector<float>> onlineSoftmaxWithDot1PASS_v2(
+    const std::vector<float> &src, const std::vector<std::vector<float>> &value) {
+
+    size_t len_tile = src.size();
+    size_t size_per_head = value[0].size();
+
+    float max_value = -INFINITY;
+    float pre_max_value = -INFINITY;
+    float sum = 0.f;
+
+    std::vector<float> O_prime(size_per_head, 0.f);
+
+    for (int i = 0; i < len_tile; i++) {
+        float x_i = src[i];
+
+        max_value = std::max(max_value, x_i);
+        float exp_new = std::exp(x_i - max_value);
+        float exp_scale = (i == 0) ? 0.f : std::exp(pre_max_value - max_value);
+        sum = sum * exp_scale + exp_new;
+
+        for (int j = 0; j < size_per_head; j++) {
+            O_prime[j] = O_prime[j] * exp_scale + exp_new * value[i][j];
+        }
+
+        pre_max_value = max_value;
+    }
+
+    // Compute logsumexp (lse)
+    float lse = logf(sum) + max_value;
+
+    // Recover final O by dividing by sum
+    std::vector<float> O_local(size_per_head);
+    for (int j = 0; j < size_per_head; j++) {
+        O_local[j] = O_prime[j] / sum;
+    }
+
+    return std::make_tuple(lse, O_local);
 }
 
 vector<float> flash_decoding(
@@ -125,7 +167,7 @@ vector<float> flash_decoding(
 
     // 切 v
     std::vector<std::vector<float>> v1 = {v_mat[0], v_mat[1]};
-    auto [lse1, O_local1] =  onlineSoftmaxWithDot1PASS(qk1, v1);
+    auto [lse1, O_local1] =  onlineSoftmaxWithDot1PASS_v2(qk1, v1);
 
     // 块2
     vector<float> qk2(len_tile);
@@ -140,7 +182,7 @@ vector<float> flash_decoding(
     // 切 v
     std::vector<std::vector<float>> v2 = {v_mat[2], v_mat[3]};
 
-    auto [lse2, O_local2] =  onlineSoftmaxWithDot1PASS(qk2, v2);
+    auto [lse2, O_local2] =  onlineSoftmaxWithDot1PASS_v2(qk2, v2);
 
     // reduction
     vector<float> output(d_k);
